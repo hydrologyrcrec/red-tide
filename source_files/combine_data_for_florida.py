@@ -1,187 +1,217 @@
+from __future__ import annotations
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 import re
 import numpy as np
-import h5py
 import xarray as xr
 from pyresample import geometry, kd_tree
-import rasterio
-from rasterio.transform import from_origin
+from typing import List, Dict
 
-# Input directory - contains all MODIS granules
-IN_DIR  = Path("/Users/akhilreddy/Downloads/Red-Tide/Data/MODISA_L2_OC_2022.0-20250716_205129")    
+# ------------------------ Configuration ------------------------
 
-# Output directory - Driectory where the combined modis granules will be added
-OUT_DIR = Path("/Users/akhilreddy/Downloads/Red-Tide/Data/MODISA_L2_OC_2022-2023-Combined-Data")      
-OUT_DIR.mkdir(exist_ok=True, parents=True)
+# Input and output directories
+INPUT_DIR = Path("/Users/akhilreddy/Downloads/Red-Tide/Data/MODISA_L2_OC_2022.0-20250716_205129")
+OUTPUT_DIR = Path("/Users/akhilreddy/Downloads/Red-Tide/Data/MODISA_L2_OC_2022-2023-Combined-Data")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Filtering only required parameters
-REQUIRED_PARAMS  = ["nflh", "Rrs_488", "Kd_490", "par", "Rrs_469", "chlor_a", "Rrs_443"]
+# Parameters to extract from L2 OC files
+PARAMS_REQUIRED = ["chlor_a", "Kd_490", "nflh", "par", "Rrs_443", "Rrs_469", "Rrs_488"]
+PARAMS_OPTIONAL = ["l2_flags"]  # Include if you want to preserve QA information
+PARAMS = PARAMS_REQUIRED + PARAMS_OPTIONAL
 
-# Bounding box for florida region: https://observablehq.com/@rdmurphy/u-s-state-bounding-boxes
-# West Longitude: -87.634938
-# South Latitude: 24.523096
-# East Longitude: -80.031362
-# North Latitude: 31.000888
-BBOX = dict(lat_min=24.523096, lat_max=31.000888, lon_min=-87.634938, lon_max=-80.031362)
-TARGET_RES = 0.01        # degrees (≈1 km)
-FILL_VALUE = np.nan       # use NaN internally; original _FillValue kept in attrs
+# Fill value and dtype settings
+FILL_VALUE = np.nan          # Standard fill value (NaN)
+DTYPE = np.float32           # Use float32 for space-efficient storage
 
-# ---------- GRID PREPARATION -------------------------------------------------
-lat_grid = np.arange(BBOX["lat_max"], BBOX["lat_min"] - TARGET_RES, -TARGET_RES)
-lon_grid = np.arange(BBOX["lon_min"], BBOX["lon_max"] + TARGET_RES,  TARGET_RES)
-lon2d, lat2d = np.meshgrid(lon_grid, lat_grid)            # 2‑D target grid
+# Resampling and grid configuration
+RADIUS_METERS = 5000         # Radius of influence for nearest-neighbor resampling (in meters)
+RESOLUTION_DEG = 0.01        # Output grid resolution (in degrees ≈ 1 km)
 
-target_def = geometry.GridDefinition(lons=lon2d, lats=lat2d)
-ny, nx = lat2d.shape
-# -----------------------------------------------------------------------------
+# Florida bounding box for output grid
+LAT_MIN, LAT_MAX = 24.52, 31.0
+LON_MIN, LON_MAX = -87.63, -80.03
 
-# holds latitude / longitude arrays
-NAV_GROUP = "navigation_data"  
+# Compositing strategy: mean, max, or latest
+COMPOSITE_RULE = "mean"
 
-# holds science variables
-GEO_GROUP = "geophysical_data"         
+# Toggle for applying l2_flags-based QA mask
+APPLY_QA_MASK = False
 
-def parse_date(fname: str) -> datetime.date:
-    """Extract YYYY-MM-DD from filenames like AQUA_MODIS.20220601T181500.L2.OC.nc"""
-    m = re.search(r"AQUA_MODIS\.(\d{8})T\d{6}", fname)
-    if not m:
-        raise ValueError(f"Cannot parse date from {fname}")
-    return datetime.strptime(m.group(1), "%Y%m%d").date()
+# --------------------- Target Grid Setup ------------------------
 
-def group_files_by_day(in_dir: Path) -> dict[datetime.date, list[Path]]:
-    """Return {date: [granule1, granule2, …]}."""
-    per_day = defaultdict(list)
-    for fp in in_dir.glob("*.nc"):
-        per_day[parse_date(fp.name)].append(fp)
-    return per_day
+def make_target_grid():
+    """Return 2‑D lat/lon and pyresample definition of the ROI grid."""
+    lat_vec = np.arange(LAT_MAX, LAT_MIN - RESOLUTION_DEG, -RESOLUTION_DEG)
+    lon_vec = np.arange(LON_MIN, LON_MAX + RESOLUTION_DEG, RESOLUTION_DEG)
+    lon2d, lat2d = np.meshgrid(lon_vec, lat_vec)
+    grid_def = geometry.GridDefinition(lats=lat2d, lons=lon2d)
+    return lat_vec, lon_vec, lat2d, lon2d, grid_def
 
-def remap_swath(raw, lats, lons):
-    """Nearest‑neighbour remap raw swath array onto target grid."""
-    swath_def = geometry.SwathDefinition(lons=lons, lats=lats)
-    return kd_tree.resample_nearest(
-        source_geo_def = swath_def,
-        target_geo_def = target_def,
-        data           = raw,
-        radius_of_influence = 5000,
-        fill_value     = np.nan,
-        nprocs         = 1
-    )
+LAT_VEC, LON_VEC, LAT2D, LON2D, TARGET_DEF = make_target_grid()
+_RE_DATE = re.compile(r"AQUA_MODIS\.(\d{8})T\d{6}")
 
-def clean_attrs(h5_attrs):
-    """Return NetCDF‑safe attribute dict."""
+# ----------------------- Utilities -----------------------------
+
+def extract_date(path: Path) -> str | None:
+    """Extract YYYYMMDD from filename."""
+    m = _RE_DATE.search(path.name)
+    return m.group(1) if m else None
+
+# ------------------ Granule Processing -------------------------
+
+def resample_swath(nc_path: Path, grid_def: geometry.GridDefinition) -> Dict[str, np.ndarray]:
+    """
+    Read a single MODIS-Aqua L2 OC granule, remap selected parameters to the fixed output grid.
+    Applies cloud/glint mask if APPLY_QA_MASK is True.
+    """
     out = {}
-    for k, v in h5_attrs.items():
-        k = str(k)
-        if isinstance(v, bytes):
-            v = v.decode("utf-8")
-        elif isinstance(v, np.ndarray):
-            if v.size == 1:
-                v = v.item()
-            else:
-                continue
-        out[k] = v
+    with xr.open_dataset(nc_path, group="geophysical_data", chunks={}) as ds:
+        nav = xr.open_dataset(nc_path, group="navigation_data", chunks={})
+        lats = nav["latitude"].values
+        lons = nav["longitude"].values
+        swath_def = geometry.SwathDefinition(lats=lats, lons=lons)
+
+        if APPLY_QA_MASK and "l2_flags" in ds:
+            flags = ds["l2_flags"].values
+            good = (flags & 0b111) == 0
+        else:
+            good = np.ones_like(ds[PARAMS[0]].values, dtype=bool)
+
+        for p in PARAMS:
+            if p not in ds:
+                raise KeyError(f"{p} missing in {nc_path}")
+
+            data = ds[p].values.astype(DTYPE)
+            data[~good] = np.nan  # apply QA mask only if enabled
+
+            remapped = kd_tree.resample_nearest(
+                source_geo_def=swath_def,
+                data=data,
+                target_geo_def=grid_def,
+                radius_of_influence=RADIUS_METERS,
+                fill_value=FILL_VALUE
+            )
+            out[p] = remapped
+
     return out
 
-def mosaic_day(files):
-    # Initialise empty mosaic per param
-    mosaics = {p: np.full((ny, nx), FILL_VALUE, dtype="float32") for p in REQUIRED_PARAMS}
-    attrs   = {}   # store attrs from first granule
+# ------------------ Daily Composite ----------------------------
 
-    for fp in files:
-        with h5py.File(fp, "r") as f:
-            lat = f["/navigation_data/latitude"][:]
-            lon = f["/navigation_data/longitude"][:]
+def composite_one_day(nc_files: List[Path]) -> tuple[xr.Dataset, xr.Dataset]:
+    nfiles = len(nc_files)
+    ny, nx = LAT2D.shape
+    stack = {p: np.full((nfiles, ny, nx), FILL_VALUE, dtype=DTYPE) for p in PARAMS}
 
-            # Clip early to bbox for speed
-            mask_bbox = (
-                (lat >= BBOX["lat_min"]) & (lat <= BBOX["lat_max"]) &
-                (lon >= BBOX["lon_min"]) & (lon <= BBOX["lon_max"])
+    for idx, nc in enumerate(nc_files):
+        remap = resample_swath(nc, TARGET_DEF)
+        for p, arr in remap.items():
+            stack[p][idx] = arr
+
+    comp = {}
+    for p, cube in stack.items():
+        if COMPOSITE_RULE == "mean":
+            valid_mask = ~np.isnan(cube)
+            valid_count = np.sum(valid_mask, axis=0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                summed = np.nansum(cube, axis=0)
+                mean = np.where(valid_count > 0, summed / valid_count, FILL_VALUE)
+            comp[p] = mean
+        elif COMPOSITE_RULE == "max":
+            comp[p] = np.nanmax(cube, axis=0)
+        elif COMPOSITE_RULE == "latest":
+            for slice_idx in reversed(range(nfiles)):
+                layer = cube[slice_idx]
+                mask = ~np.isnan(layer)
+                if slice_idx == nfiles - 1:
+                    latest = layer
+                else:
+                    latest[mask] = layer[mask]
+            comp[p] = latest
+        else:
+            raise ValueError("Unknown COMPOSITE_RULE")
+
+    geo_ds = xr.Dataset(
+        {
+            p: (("lat", "lon"), comp[p],
+                {"_FillValue": FILL_VALUE, "units": getattr_unit(p)})
+            for p in comp
+        },
+        coords={
+            "lat": ("lat", LAT_VEC, {"units": "degrees_north"}),
+            "lon": ("lon", LON_VEC, {"units": "degrees_east"})
+        },
+        attrs={
+            "title": "MODIS‑Aqua daily OC composite",
+            "institution": "Generated by composite_one_day()",
+            "source": "NASA MODIS‑Aqua L2 OC granules",
+            "history": f"Created {datetime.now(timezone.utc).isoformat()}",
+            "composite_rule": COMPOSITE_RULE,
+            "masking_applied": str(APPLY_QA_MASK)
+        }
+    )
+
+    nav_ds = xr.Dataset(
+        {
+            "latitude": (("lat", "lon"), LAT2D),
+            "longitude": (("lat", "lon"), LON2D)
+        },
+        coords=geo_ds.coords,
+    )
+
+    return geo_ds, nav_ds
+
+def getattr_unit(varname: str) -> str:
+    """Return scientific units for known ocean color parameters."""
+    default = "1"
+    units = {
+        "chlor_a": "mg m^-3",
+        "nflh": "W cm^-2 µm^-1 sr^-1",
+        "par": "Einstein m^-2 day^-1",
+        "Kd_490": "m^-1",
+        "Rrs_443": "sr^-1",
+        "Rrs_469": "sr^-1",
+        "Rrs_488": "sr^-1",
+    }
+    return units.get(varname, default)
+
+# --------------------- Main Driver ------------------------------
+
+def main() -> None:
+    groups: Dict[str, List[Path]] = defaultdict(list)
+    for f in INPUT_DIR.rglob("*.L2.OC.nc"):
+        d = extract_date(f)
+        if d:
+            groups[d].append(f)
+
+    if not groups:
+        raise RuntimeError(f"No granules found in {INPUT_DIR}")
+
+    print(f"Found {len(groups)} days to process")
+    for day, files in sorted(groups.items()):
+        out_nc = OUTPUT_DIR / f"AQUA_MODIS_FL.{day}.L2.OC.nc"
+        if out_nc.exists():
+            print(f"[{day}] already done – skipping")
+            continue
+
+        print(f"[{day}] building composite from {len(files)} swaths")
+        try:
+            geo_ds, nav_ds = composite_one_day(sorted(files))
+
+            geo_ds.to_netcdf(
+                out_nc,
+                group="geophysical_data",
+                encoding={v: {"zlib": True, "complevel": 4} for v in geo_ds.data_vars}
             )
-            if not mask_bbox.any():
-                continue  # granule outside bbox
-
-            for p in REQUIRED_PARAMS:
-                if p not in f["/geophysical_data"]:
-                    continue
-                raw = f[f"/geophysical_data/{p}"][:]
-                att = f[f"/geophysical_data/{p}"].attrs
-                if p not in attrs:
-                    attrs[p] = clean_attrs(att)
-
-                fill_val = att.get("_FillValue", None)
-                if fill_val is not None:
-                    raw = np.where(raw == fill_val, np.nan, raw)
-
-                # Mask outside bbox
-                raw = np.where(mask_bbox, raw, np.nan)
-
-                # Remap
-                remapped = remap_swath(raw, lat, lon)
-
-                # Insert into mosaic: keep first valid encounter
-                mosaic = mosaics[p]
-                mask_new = np.isnan(mosaic) & ~np.isnan(remapped)
-                mosaic[mask_new] = remapped[mask_new]
-
-    # Build xarray Dataset
-    data_vars = {}
-    for p, arr in mosaics.items():
-        da = xr.DataArray(arr, dims=("lat", "lon"),
-                          coords={"lat": lat_grid, "lon": lon_grid},
-                          attrs=attrs.get(p, {}))
-        da.attrs["_FillValue"] = np.float32(np.nan)       # CF nan
-        data_vars[p] = da
-
-    ds = xr.Dataset(data_vars)
-    ds.attrs["Conventions"] = "CF-1.6"
-    ds.attrs["title"] = "MODIS Aqua L2 OC – Florida mosaic"
-    # CF grid_mapping (WGS‑84)
-    ds["crs"] = xr.DataArray(0, attrs={
-        "grid_mapping_name": "latitude_longitude",
-        "epsg_code": "EPSG:4326",
-        "semi_major_axis": 6378137.0,
-        "inverse_flattening": 298.257223563
-    })
-    for v in ds.data_vars:
-        ds[v].attrs["grid_mapping"] = "crs"
-
-    return ds
-
-def save_geotiff(da: xr.DataArray, out_path: Path):
-    """Save single‑band GeoTIFF for quick GIS preview."""
-    arr = da.values.astype("float32")
-    transform = from_origin(lon_grid.min(), lat_grid.max(), TARGET_RES, TARGET_RES)
-    with rasterio.open(
-        out_path, "w",
-        driver="GTiff",
-        height=arr.shape[0],
-        width=arr.shape[1],
-        count=1,
-        dtype="float32",
-        crs="EPSG:4326",
-        transform=transform,
-        nodata=np.nan
-    ) as dst:
-        dst.write(arr, 1)
-
-def main():
-    for day, files in sorted(group_files_by_day(IN_DIR).items()):
-        print(f"🟢 {day}: mosaicking {len(files)} granules…")
-        ds = mosaic_day(files)
-
-        nc_out = OUT_DIR / f"AQUA_MODIS_FL.{day}.L2.OC.nc" 
-        comp   = {"zlib": True, "complevel": 4}
-        enc    = {v: comp for v in ds.data_vars}
-        ds.to_netcdf(nc_out, encoding=enc)
-        print(f"   ✅ NetCDF written: {nc_out}")
-
-        # Optional GeoTIFF preview for first parameter
-        # first_param = next(iter(ds.data_vars))
-        # tif_out = OUT_DIR / f"{first_param}_{day}.tif"
-        # # save_geotiff(ds[first_param], tif_out)
-        # print(f"   ✅ GeoTIFF preview: {tif_out}")
+            nav_ds.to_netcdf(
+                out_nc,
+                mode="a",
+                group="navigation_data",
+                encoding={v: {"zlib": True, "complevel": 4} for v in nav_ds.data_vars}
+            )
+            print(f"[{day}] written → {out_nc}")
+        except Exception as exc:
+            print(f"[{day}] ERROR: {exc}")
 
 if __name__ == "__main__":
     main()
